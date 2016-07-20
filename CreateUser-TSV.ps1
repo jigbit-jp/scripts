@@ -1,8 +1,9 @@
-﻿Param(
+Param(
     [switch]$GeneratePassword=$false,
+    [switch]$SkipHeader=$false,
     [int]$PasswordLength=10,
-    [Parameter(Mandatory)]$ImputFile,
-    [string]$OutputFile="result.txt"
+    [Parameter(Mandatory)]$InputFile,
+    [Parameter(Mandatory)]$OutputFile
 ) 
 # Create local windows users from tsv file.
 #
@@ -13,11 +14,10 @@
 
 
 $ErrorActionPreference = "Stop"
-
+$random = New-Object System.Random
 
 function generatePassword ($passwordLength) {
     $characterTable = ($larges + $smalls + $digits + $symbols).ToCharArray()
-    $random = New-Object System.Random
 
     $candidatePassword = ""
     for($i = 1; $i -le $passwordLength; $i++) {
@@ -43,6 +43,9 @@ $ADS_UF_DONT_EXPIRE_PASSWD = 65536
 # これでは設定できない
 # $ADS_UF_PASSWORD_EXPIRED = [System.UInt32]8388608 # 0x800000
 
+# パスワード再生成の最大値
+$retryLimit = 10
+
 
 $computerName = $env:COMPUTERNAME
 $ou = [ADSI]"WinNT://$computerName"
@@ -52,7 +55,7 @@ $groupList=@{}
 
 # ファイルの読み込み
 # 先頭行はヘッダとして読み飛ばす
-# TODO: Import-CSVを用いるかどうかは検討
+# TODO: Inport-CSVを用いるかどうかは検討
 # フォーマット(タブ区切り)
     # name: ユーザ名
     # full name: フルネーム
@@ -62,8 +65,8 @@ $groupList=@{}
     # user cannot change password: ユーザーはパスワードを変更できない(0, 無効, false, 1, 有効, trueのいずれか)
     # password never expires: パスワードを無期限にする(0, 無効, false, 1, 有効, trueのいずれか)
     # account is disable: アカウントを無効にする(0, 無効, false, 1, 有効, trueのいずれか)
-$userLists = Get-Content $ImputFile `
-    | Select-Object -Skip 1 `
+$userLists = Get-Content $InputFile `
+    | Select-Object -Skip ([int]$SkipHeader.ToBool()) `
     | ConvertFrom-Csv -Delimiter "`t" -Header "name","fullName","groups","password","mustChangePasswordAtNextLogon","cantChangePassowrd","isNeverExpires","isDisable"
 
 
@@ -95,17 +98,40 @@ $userLists = Get-Content $ImputFile `
         $userFlags = $userFlags -bor $ADS_UF_ACCOUNTDISABLE
     }
 
-    # パスワードが'RANDOM'か、GeneratePasswordオプションが指定された場合はパスワードを生成
-    if($_.password -eq "RANDOM" -or $GeneratePassword) {
-        $_.password = generatePassword($PasswordLength)
-    }
-
-    # ユーザの作成
-    $user.setpassword($_.password)
     $user.put("FullName", $_.fullName)
     $user.put("description", "")
     $user.put("UserFlags", $userFlags)
-    $user.setInfo()
+
+    # パスワードが'RANDOM'か、GeneratePasswordオプションが指定された場合はパスワードを生成
+    if($_.password -eq "RANDOM" -or $GeneratePassword) {
+        for($i = 0; $i -lt $retryLimit;$i++) {
+            try {
+                $_.password = generatePassword($PasswordLength)
+                $user.setpassword($_.password)
+                $user.setInfo()
+                break
+
+            } catch [Exception] {
+                # 既に存在する
+                # -2147022672
+
+                # 複雑性の要件を満たしていない場合のみリトライ
+                # -2147022651
+                # https://www.manageengine.jp/products/ADSelfService_Plus/ADSSP_help_J/misc/troubleshooting_tips.html#error_800708c5
+                if($error[0].Exception.InnerException.ErrorCode -ne -2147022651) {
+                    throw $error[0]
+                }
+            }
+        }
+    } else {
+        $user.setpassword($_.password)
+        $user.setInfo()
+    }
+
+    if($i -eq $retryLimit) {
+        throw "Reached retry limit"
+    }
+
 
     $joinGroups = $_.groups -split " *, *"
     foreach($groupName in $joinGroups) {
